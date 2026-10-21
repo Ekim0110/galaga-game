@@ -1,7 +1,8 @@
-// "Motor" del juego: aquí vive TODA la lógica (movimiento, disparos, choques, puntos).
+// "Motor" del juego: aquí vive TODA la lógica (movimiento, disparos, choques, puntos, niveles).
 // No sabe nada de React: solo recibe el estado, el tiempo que pasó y las teclas,
 // y actualiza el estado. Separarlo así hace el código más fácil de entender y probar.
 
+import type { SoundEvent } from "./sound";
 import {
   BEE_SPRITE,
   BOSS_HURT_SPRITE,
@@ -19,28 +20,32 @@ export const HEIGHT = 640;
 const SCALE = 3; // tamaño de cada pixel de los sprites
 const PLAYER_SPEED = 260; // pixeles por segundo
 const BULLET_SPEED = 520;
-const ENEMY_BULLET_SPEED = 240;
 const MAX_PLAYER_BULLETS = 2; // como en el Galaga original: máximo 2 balas a la vez
 const START_LIVES = 3;
+const EXTRA_LIFE_EVERY = 20000; // puntos para ganar una vida extra
+const PLAYER_Y = HEIGHT - 50;
 
 export type EnemyKind = "bee" | "butterfly" | "boss";
-type EnemyMode = "formation" | "diving" | "returning";
+// formation = quieto en su lugar, diving = atacando, returning = volviendo,
+// challenge = volando por una ruta en la fase de desafío
+type EnemyMode = "formation" | "diving" | "returning" | "challenge";
 
 export interface Enemy {
   kind: EnemyKind;
   hp: number;
-  // Lugar que le toca en la formación (fila y columna)
-  slotX: number;
+  slotX: number; // lugar que le toca en la formación
   slotY: number;
-  // Posición actual en pantalla
-  x: number;
+  x: number; // posición actual en pantalla
   y: number;
   mode: EnemyMode;
-  // Datos del ataque en picada
   diveTime: number;
   diveStartX: number;
   diveDir: 1 | -1;
-  hasShot: boolean;
+  shotsLeft: number; // cuántas balas le quedan en este ataque
+  nextShotY: number; // altura a la que dispara la siguiente bala
+  // Solo para la fase de desafío:
+  path: number;
+  delay: number;
 }
 
 interface Bullet {
@@ -64,37 +69,197 @@ interface Explosion {
   color: string;
 }
 
-export type Phase = "menu" | "playing" | "gameover";
+// Texto flotante (por ejemplo "+400") que aparece donde muere un enemigo
+interface Popup {
+  x: number;
+  y: number;
+  text: string;
+  time: number;
+}
+
+export type Phase = "menu" | "playing" | "levelclear" | "gameover";
 
 export interface GameState {
   phase: Phase;
   score: number;
   highScore: number;
+  nextExtraLife: number;
   lives: number;
-  wave: number;
+  level: number;
   playerX: number;
   playerAlive: boolean;
-  respawnTimer: number; // segundos hasta reaparecer tras morir
-  invulnerable: number; // segundos de invulnerabilidad al reaparecer
+  respawnTimer: number;
+  invulnerable: number;
   shootCooldown: number;
   bullets: Bullet[];
   enemyBullets: Bullet[];
   enemies: Enemy[];
   stars: Star[];
   explosions: Explosion[];
-  formationTime: number; // reloj para el vaivén de la formación
-  diveTimer: number; // cuenta atrás para lanzar el siguiente ataque
-  waveBanner: number; // segundos que se muestra "OLEADA X"
+  popups: Popup[];
+  formationTime: number;
+  diveTimer: number;
+  levelBanner: number; // segundos que se muestra "NIVEL X"
+  phaseTimer: number; // tiempo restante de la pantalla de "nivel completado"
+  // Fase de desafío
+  challengeHits: number;
+  challengeTotal: number;
+  challengeBonus: number;
+  // Sonidos que el motor pide; el componente de React los reproduce
+  events: SoundEvent[];
 }
 
-// Teclas que el componente de React nos pasa en cada cuadro
 export interface Input {
   left: boolean;
   right: boolean;
   fire: boolean;
 }
 
-const PLAYER_Y = HEIGHT - 50;
+// ---------- Niveles ----------
+
+// Cada formación es un dibujo: B = jefe, R = mariposa, Y = abeja, . = vacío.
+// Así es fácil inventar niveles nuevos: solo dibujas otra forma.
+const LAYOUTS: string[][] = [
+  // Nivel 1: la clásica
+  [
+    "...BBBB...",
+    ".RRRRRRRR.",
+    ".RRRRRRRR.",
+    "YYYYYYYYYY",
+    "YYYYYYYYYY",
+  ],
+  // Nivel 2: forma de V
+  [
+    "B........B",
+    "RB......BR",
+    ".RR....RR.",
+    "..YYYYYY..",
+    "...YYYY...",
+    "....YY....",
+  ],
+  // Nivel 4: diamante
+  [
+    "....BB....",
+    "...RRRR...",
+    "..RRBBRR..",
+    ".YYYYYYYY.",
+    "..YYYYYY..",
+    "...YYYY...",
+  ],
+  // Nivel 5: fortaleza
+  [
+    "B.B.BB.B.B",
+    "RRRRRRRRRR",
+    "R.YYYYYY.R",
+    "R.YYYYYY.R",
+    "YYYYYYYYYY",
+  ],
+  // Nivel 7: dos alas
+  [
+    "BB......BB",
+    "RRR....RRR",
+    "RRRY..YRRR",
+    "YYYYYYYYYY",
+    ".YYY..YYY.",
+  ],
+];
+
+// Cada 3 niveles hay una "fase de desafío" (como en Galaga).
+export function isChallengeLevel(level: number) {
+  return level % 3 === 0;
+}
+
+// Los números de dificultad suben con el nivel, pero con un tope para que siga siendo jugable.
+function difficulty(level: number) {
+  return {
+    diveSpeed: Math.min(160 + level * 18, 340),
+    maxDivers: Math.min(1 + level, 7),
+    diveInterval: Math.max(0.45, 2.3 - level * 0.2),
+    shotsPerDive: level < 3 ? 1 : level < 6 ? 2 : 3,
+    enemyBulletSpeed: Math.min(220 + level * 12, 360),
+    swaySpeed: 0.8 + level * 0.05,
+  };
+}
+
+function newEnemy(kind: EnemyKind, slotX: number, slotY: number): Enemy {
+  return {
+    kind,
+    hp: kind === "boss" ? 2 : 1,
+    slotX,
+    slotY,
+    x: slotX,
+    y: -40,
+    mode: "returning",
+    diveTime: 0,
+    diveStartX: slotX,
+    diveDir: 1,
+    shotsLeft: 0,
+    nextShotY: 0,
+    path: 0,
+    delay: 0,
+  };
+}
+
+function makeFormation(level: number): Enemy[] {
+  // Cuál formación toca (sin contar las fases de desafío)
+  const normalIndex = level - 1 - Math.floor(level / 3);
+  const layout = LAYOUTS[normalIndex % LAYOUTS.length];
+  const spacingX = 42;
+  const spacingY = 34;
+  const enemies: Enemy[] = [];
+  layout.forEach((row, r) => {
+    const rowWidth = (row.length - 1) * spacingX;
+    [...row].forEach((ch, c) => {
+      const kind: EnemyKind | null = ch === "B" ? "boss" : ch === "R" ? "butterfly" : ch === "Y" ? "bee" : null;
+      if (!kind) return;
+      const e = newEnemy(kind, WIDTH / 2 - rowWidth / 2 + c * spacingX, 80 + r * spacingY);
+      // Entran desde arriba, desde la izquierda o la derecha según la columna
+      e.x = c < row.length / 2 ? -30 - r * 20 : WIDTH + 30 + r * 20;
+      e.y = -30 - r * 25;
+      enemies.push(e);
+    });
+  });
+  return enemies;
+}
+
+// Rutas de la fase de desafío: dado un tiempo t (segundos) devuelven una posición.
+function challengePath(path: number, t: number) {
+  switch (path % 4) {
+    case 0: // ola de izquierda a derecha
+      return { x: -30 + t * 130, y: 120 + Math.sin(t * 1.8) * 110 + t * 25 };
+    case 1: // ola de derecha a izquierda
+      return { x: WIDTH + 30 - t * 130, y: 120 + Math.sin(t * 1.8) * 110 + t * 25 };
+    case 2: {
+      // espiral bajando por el centro
+      const a = t * 2.4;
+      const r = 30 + t * 30;
+      return { x: WIDTH / 2 + Math.cos(a) * r * 1.5, y: -20 + t * 75 + Math.sin(a) * r * 0.6 };
+    }
+    default: // rizo: baja, da una vuelta y sale por la derecha
+      return { x: 40 + t * 85 + Math.cos(t * 3) * 70, y: -30 + t * 60 + Math.sin(t * 3) * 80 };
+  }
+}
+
+function makeChallenge(level: number): Enemy[] {
+  const kinds: EnemyKind[] = ["bee", "butterfly", "boss", "butterfly", "bee"];
+  const enemies: Enemy[] = [];
+  const groups = 5;
+  const perGroup = 8;
+  const speedUp = Math.min(level / 30, 0.3); // los desafíos posteriores llegan más rápido
+  for (let g = 0; g < groups; g++) {
+    for (let i = 0; i < perGroup; i++) {
+      const e = newEnemy(kinds[g], 0, 0);
+      e.hp = 1; // en el desafío todos caen de un disparo
+      e.mode = "challenge";
+      e.path = g + Math.floor(level / 3);
+      e.delay = g * (3.6 - speedUp * 3) + i * 0.22;
+      e.x = -100;
+      e.y = -100;
+      enemies.push(e);
+    }
+  }
+  return enemies;
+}
 
 // ---------- Creación del estado ----------
 
@@ -108,49 +273,14 @@ function makeStars(): Star[] {
   }));
 }
 
-// Arma la formación de enemigos: 1 fila de jefes, 2 de mariposas, 2 de abejas.
-function makeWave(): Enemy[] {
-  const rows: { kind: EnemyKind; cols: number }[] = [
-    { kind: "boss", cols: 4 },
-    { kind: "butterfly", cols: 8 },
-    { kind: "butterfly", cols: 8 },
-    { kind: "bee", cols: 10 },
-    { kind: "bee", cols: 10 },
-  ];
-  const spacingX = 42;
-  const spacingY = 36;
-  const enemies: Enemy[] = [];
-  rows.forEach((row, r) => {
-    const rowWidth = (row.cols - 1) * spacingX;
-    for (let c = 0; c < row.cols; c++) {
-      const slotX = WIDTH / 2 - rowWidth / 2 + c * spacingX;
-      const slotY = 80 + r * spacingY;
-      enemies.push({
-        kind: row.kind,
-        hp: row.kind === "boss" ? 2 : 1,
-        slotX,
-        slotY,
-        // Empiezan arriba fuera de pantalla y "vuelan" a su lugar
-        x: slotX,
-        y: -40 - r * 30,
-        mode: "returning",
-        diveTime: 0,
-        diveStartX: slotX,
-        diveDir: 1,
-        hasShot: false,
-      });
-    }
-  });
-  return enemies;
-}
-
 export function createGame(highScore = 0): GameState {
   return {
     phase: "menu",
     score: 0,
     highScore,
+    nextExtraLife: EXTRA_LIFE_EVERY,
     lives: START_LIVES,
-    wave: 1,
+    level: 1,
     playerX: WIDTH / 2,
     playerAlive: true,
     respawnTimer: 0,
@@ -161,28 +291,45 @@ export function createGame(highScore = 0): GameState {
     enemies: [],
     stars: makeStars(),
     explosions: [],
+    popups: [],
     formationTime: 0,
-    diveTimer: 2.5,
-    waveBanner: 0,
+    diveTimer: 3,
+    levelBanner: 0,
+    phaseTimer: 0,
+    challengeHits: 0,
+    challengeTotal: 0,
+    challengeBonus: 0,
+    events: [],
   };
 }
 
-export function startGame(state: GameState) {
+function beginLevel(state: GameState) {
+  const challenge = isChallengeLevel(state.level);
+  state.phase = "playing";
+  state.enemies = challenge ? makeChallenge(state.level) : makeFormation(state.level);
+  state.enemyBullets = [];
+  state.bullets = [];
+  state.levelBanner = 2;
+  state.diveTimer = 3;
+  state.formationTime = 0;
+  state.challengeHits = 0;
+  state.challengeTotal = challenge ? state.enemies.length : 0;
+  state.challengeBonus = 0;
+  state.events.push(challenge ? "challengeStart" : "levelStart");
+}
+
+// "startLevel" permite empezar en otro nivel (solo lo usamos para probar).
+export function startGame(state: GameState, startLevel = 1) {
   const fresh = createGame(state.highScore);
-  Object.assign(state, fresh, {
-    phase: "playing" as Phase,
-    stars: state.stars,
-    enemies: makeWave(),
-    waveBanner: 2,
-    invulnerable: 2,
-  });
+  Object.assign(state, fresh, { stars: state.stars, invulnerable: 2, level: startLevel });
+  beginLevel(state);
 }
 
 // ---------- Ayudantes ----------
 
-// Dónde está ahora el "hueco" de un enemigo: la formación se mueve de lado a lado.
 function slotPosition(state: GameState, e: Enemy) {
-  const sway = Math.sin(state.formationTime * 0.8) * 30;
+  // La formación se mece de lado a lado
+  const sway = Math.sin(state.formationTime * difficulty(state.level).swaySpeed) * 30;
   return { x: e.slotX + sway, y: e.slotY };
 }
 
@@ -199,9 +346,19 @@ function enemyColor(kind: EnemyKind) {
   return "#ffd23b";
 }
 
-// Choque simple entre dos rectángulos/círculos: ¿están cerca?
 function hit(ax: number, ay: number, bx: number, by: number, dx: number, dy: number) {
   return Math.abs(ax - bx) < dx && Math.abs(ay - by) < dy;
+}
+
+function addScore(state: GameState, amount: number, x: number, y: number) {
+  state.score += amount;
+  if (amount >= 150) state.popups.push({ x, y, text: String(amount), time: 0 });
+  if (state.score >= state.nextExtraLife) {
+    state.lives += 1;
+    state.nextExtraLife += EXTRA_LIFE_EVERY;
+    state.events.push("extraLife");
+  }
+  if (state.score > state.highScore) state.highScore = state.score;
 }
 
 function killPlayer(state: GameState) {
@@ -209,9 +366,10 @@ function killPlayer(state: GameState) {
   state.explosions.push({ x: state.playerX, y: PLAYER_Y, time: 0, color: "#ffffff" });
   state.lives -= 1;
   state.bullets = [];
+  state.events.push("playerDie");
   if (state.lives <= 0) {
     state.phase = "gameover";
-    state.highScore = Math.max(state.highScore, state.score);
+    state.events.push("gameOver");
   } else {
     state.respawnTimer = 1.5;
   }
@@ -220,7 +378,6 @@ function killPlayer(state: GameState) {
 // ---------- Actualización (se llama ~60 veces por segundo) ----------
 
 export function update(state: GameState, dt: number, input: Input) {
-  // Las estrellas siempre se mueven, incluso en el menú
   for (const s of state.stars) {
     s.y += s.speed * dt;
     if (s.y > HEIGHT) {
@@ -229,11 +386,25 @@ export function update(state: GameState, dt: number, input: Input) {
     }
   }
   state.explosions = state.explosions.filter((ex) => (ex.time += dt) < 0.5);
+  state.popups = state.popups.filter((p) => (p.time += dt) < 0.9);
+
+  // Pantalla de "nivel completado": esperamos y pasamos al siguiente
+  if (state.phase === "levelclear") {
+    state.phaseTimer -= dt;
+    if (state.phaseTimer <= 0) {
+      state.level += 1;
+      beginLevel(state);
+    }
+    return;
+  }
 
   if (state.phase !== "playing") return;
 
+  const diff = difficulty(state.level);
+  const challenge = isChallengeLevel(state.level);
+
   state.formationTime += dt;
-  state.waveBanner = Math.max(0, state.waveBanner - dt);
+  state.levelBanner = Math.max(0, state.levelBanner - dt);
   state.invulnerable = Math.max(0, state.invulnerable - dt);
   state.shootCooldown = Math.max(0, state.shootCooldown - dt);
 
@@ -246,10 +417,10 @@ export function update(state: GameState, dt: number, input: Input) {
     if (input.fire && state.shootCooldown === 0 && state.bullets.length < MAX_PLAYER_BULLETS) {
       state.bullets.push({ x: state.playerX, y: PLAYER_Y - 20, vx: 0, vy: -BULLET_SPEED });
       state.shootCooldown = 0.18;
+      state.events.push("shoot");
     }
   } else {
     state.respawnTimer -= dt;
-    // Solo reaparece cuando no hay enemigos atacando, para ser justo
     const someoneDiving = state.enemies.some((e) => e.mode === "diving");
     if (state.respawnTimer <= 0 && !someoneDiving) {
       state.playerAlive = true;
@@ -267,35 +438,47 @@ export function update(state: GameState, dt: number, input: Input) {
   state.bullets = state.bullets.filter((b) => b.y > -10);
   state.enemyBullets = state.enemyBullets.filter((b) => b.y < HEIGHT + 10 && b.x > -10 && b.x < WIDTH + 10);
 
-  // --- Lanzar ataques en picada ---
-  // Cada oleada los ataques son más frecuentes
-  state.diveTimer -= dt;
-  const inFormation = state.enemies.filter((e) => e.mode === "formation");
-  const maxDivers = Math.min(2 + state.wave, 6);
-  const diving = state.enemies.filter((e) => e.mode === "diving").length;
-  if (state.diveTimer <= 0 && inFormation.length > 0 && state.playerAlive && diving < maxDivers) {
-    const e = inFormation[Math.floor(Math.random() * inFormation.length)];
-    e.mode = "diving";
-    e.diveTime = 0;
-    e.diveStartX = e.x;
-    e.diveDir = e.x < WIDTH / 2 ? 1 : -1;
-    e.hasShot = false;
-    state.diveTimer = Math.max(0.5, 2.2 - state.wave * 0.2) * (0.6 + Math.random() * 0.8);
+  // --- Lanzar ataques en picada (solo en niveles normales) ---
+  if (!challenge) {
+    state.diveTimer -= dt;
+    const inFormation = state.enemies.filter((e) => e.mode === "formation");
+    const diving = state.enemies.filter((e) => e.mode === "diving").length;
+    if (state.diveTimer <= 0 && inFormation.length > 0 && state.playerAlive && diving < diff.maxDivers) {
+      const e = inFormation[Math.floor(Math.random() * inFormation.length)];
+      e.mode = "diving";
+      e.diveTime = 0;
+      e.diveStartX = e.x;
+      e.diveDir = e.x < WIDTH / 2 ? 1 : -1;
+      e.shotsLeft = diff.shotsPerDive;
+      e.nextShotY = 200;
+      state.diveTimer = diff.diveInterval * (0.6 + Math.random() * 0.8);
+      state.events.push("dive");
+    }
   }
 
   // --- Mover enemigos ---
-  const diveSpeed = 170 + state.wave * 15;
   for (const e of state.enemies) {
+    if (e.mode === "challenge") {
+      // Fase de desafío: siguen su ruta y luego se van. No disparan.
+      e.delay -= dt;
+      if (e.delay > 0) continue;
+      const pos = challengePath(e.path, -e.delay);
+      e.x = pos.x;
+      e.y = pos.y;
+      const gone = -e.delay > 1.5 && (e.x < -60 || e.x > WIDTH + 60 || e.y > HEIGHT + 60);
+      if (gone || -e.delay > 9) e.hp = -1; // -1 = escapó (no cuenta como derribado)
+      continue;
+    }
+
     const slot = slotPosition(state, e);
     if (e.mode === "formation") {
       e.x = slot.x;
       e.y = slot.y;
     } else if (e.mode === "returning") {
-      // Vuela hacia su hueco en la formación
       const dx = slot.x - e.x;
       const dy = slot.y - e.y;
       const dist = Math.hypot(dx, dy);
-      const step = 220 * dt;
+      const step = 230 * dt;
       if (dist <= step) {
         e.mode = "formation";
         e.x = slot.x;
@@ -305,8 +488,7 @@ export function update(state: GameState, dt: number, input: Input) {
         e.y += (dy / dist) * step;
       }
     } else {
-      // En picada: primero un pequeño rizo hacia arriba, luego baja en zigzag
-      // persiguiendo un poco al jugador.
+      // En picada: un pequeño rizo y luego baja en zigzag persiguiendo un poco al jugador
       e.diveTime += dt;
       const t = e.diveTime;
       if (t < 0.5) {
@@ -314,24 +496,24 @@ export function update(state: GameState, dt: number, input: Input) {
         e.x = e.diveStartX + e.diveDir * (1 - Math.cos(angle)) * 25;
         e.y = slot.y - Math.sin(angle) * 30;
       } else {
-        e.y += diveSpeed * dt;
-        const chase = Math.sign(state.playerX - e.x) * 60;
+        e.y += diff.diveSpeed * dt;
+        const chase = Math.sign(state.playerX - e.x) * (40 + state.level * 6);
         e.x += (Math.sin(t * 3) * 120 * e.diveDir + chase) * dt;
       }
-      // Dispara una vez cuando va bajando
-      if (!e.hasShot && e.y > 220 && state.playerAlive) {
-        e.hasShot = true;
+      // Dispara una o varias balas mientras baja
+      if (e.shotsLeft > 0 && e.y > e.nextShotY && e.y < PLAYER_Y - 80 && state.playerAlive) {
+        e.shotsLeft -= 1;
+        e.nextShotY += 60;
         const dx = state.playerX - e.x;
         const dy = PLAYER_Y - e.y;
         const len = Math.hypot(dx, dy);
         state.enemyBullets.push({
           x: e.x,
           y: e.y + 10,
-          vx: (dx / len) * ENEMY_BULLET_SPEED * 0.5,
-          vy: ENEMY_BULLET_SPEED,
+          vx: (dx / len) * diff.enemyBulletSpeed * 0.5,
+          vy: diff.enemyBulletSpeed,
         });
       }
-      // Si sale por abajo, vuelve a aparecer arriba y regresa a la formación
       if (e.y > HEIGHT + 30) {
         e.y = -30;
         e.x = slot.x;
@@ -340,15 +522,23 @@ export function update(state: GameState, dt: number, input: Input) {
     }
   }
 
-  // --- Choques: balas del jugador contra enemigos ---
+  // --- Balas del jugador contra enemigos ---
   for (const b of state.bullets) {
     for (const e of state.enemies) {
-      if (e.hp > 0 && hit(b.x, b.y, e.x, e.y, 20, 14)) {
+      if (e.hp > 0 && (e.mode !== "challenge" || e.delay <= 0) && hit(b.x, b.y, e.x, e.y, 20, 14)) {
         e.hp -= 1;
-        b.y = -100; // la bala desaparece
+        b.y = -100;
         if (e.hp <= 0) {
-          state.score += points(e.kind, e.mode === "diving");
+          if (e.mode === "challenge") {
+            state.challengeHits += 1;
+            addScore(state, 100, e.x, e.y);
+          } else {
+            addScore(state, points(e.kind, e.mode === "diving"), e.x, e.y);
+          }
           state.explosions.push({ x: e.x, y: e.y, time: 0, color: enemyColor(e.kind) });
+          state.events.push(e.kind === "boss" ? "explode" : "enemyHit");
+        } else {
+          state.events.push("bossHit");
         }
         break;
       }
@@ -357,15 +547,15 @@ export function update(state: GameState, dt: number, input: Input) {
   state.bullets = state.bullets.filter((b) => b.y > -10);
   state.enemies = state.enemies.filter((e) => e.hp > 0);
 
-  // --- Choques contra el jugador ---
-  if (state.playerAlive && state.invulnerable === 0) {
+  // --- Choques contra el jugador (en el desafío no hay peligro) ---
+  if (!challenge && state.playerAlive && state.invulnerable === 0) {
     const shot = state.enemyBullets.find((b) => hit(b.x, b.y, state.playerX, PLAYER_Y, 16, 14));
     const rammer = state.enemies.find((e) => hit(e.x, e.y, state.playerX, PLAYER_Y, 30, 26));
     if (shot || rammer) {
       if (shot) shot.y = HEIGHT + 100;
       if (rammer) {
         rammer.hp = 0;
-        state.score += points(rammer.kind, true);
+        addScore(state, points(rammer.kind, true), rammer.x, rammer.y);
         state.explosions.push({ x: rammer.x, y: rammer.y, time: 0, color: enemyColor(rammer.kind) });
         state.enemies = state.enemies.filter((e) => e.hp > 0);
       }
@@ -373,15 +563,26 @@ export function update(state: GameState, dt: number, input: Input) {
     }
   }
 
-  if (state.score > state.highScore) state.highScore = state.score;
-
-  // --- ¿Oleada terminada? Viene la siguiente ---
+  // --- ¿Nivel terminado? ---
   if (state.phase === "playing" && state.enemies.length === 0) {
-    state.wave += 1;
-    state.enemies = makeWave();
+    state.phase = "levelclear";
+    state.phaseTimer = challenge ? 3.5 : 2.5;
     state.enemyBullets = [];
-    state.waveBanner = 2;
-    state.diveTimer = 3;
+    state.bullets = [];
+    if (challenge) {
+      const perfect = state.challengeHits === state.challengeTotal;
+      state.challengeBonus = perfect ? 10000 : state.challengeHits * 100;
+      addScore(state, state.challengeBonus, WIDTH / 2, HEIGHT / 2);
+      state.events.push(perfect ? "perfect" : "levelClear");
+    } else {
+      state.events.push("levelClear");
+    }
+    // Si estaba esperando para reaparecer, vuelve para el siguiente nivel
+    if (!state.playerAlive && state.lives > 0) {
+      state.playerAlive = true;
+      state.playerX = WIDTH / 2;
+      state.invulnerable = 2;
+    }
   }
 }
 
@@ -408,36 +609,32 @@ function text(
   ctx.fillText(value, x, y);
 }
 
-export function draw(ctx: CanvasRenderingContext2D, state: GameState) {
-  // Fondo negro
+export function draw(ctx: CanvasRenderingContext2D, state: GameState, muted = false) {
   ctx.fillStyle = "#000000";
   ctx.fillRect(0, 0, WIDTH, HEIGHT);
 
-  // Estrellas (parpadean un poco)
   for (const s of state.stars) {
     if (Math.random() < 0.03) continue;
     ctx.fillStyle = s.color;
     ctx.fillRect(s.x, s.y, 2, 2);
   }
 
-  // Enemigos
   for (const e of state.enemies) {
+    if (e.mode === "challenge" && e.delay > 0) continue;
     drawSprite(ctx, enemySprite(e), e.x, e.y, SCALE);
   }
 
-  // Jugador (parpadea mientras es invulnerable)
+  const showPlayer = state.phase === "playing" || state.phase === "levelclear";
   const blink = state.invulnerable > 0 && Math.floor(state.invulnerable * 10) % 2 === 0;
-  if (state.phase === "playing" && state.playerAlive && !blink) {
+  if (showPlayer && state.playerAlive && !blink) {
     drawSprite(ctx, PLAYER_SPRITE, state.playerX, PLAYER_Y, SCALE);
   }
 
-  // Balas
   ctx.fillStyle = "#3bf0ff";
   for (const b of state.bullets) ctx.fillRect(b.x - 1.5, b.y - 7, 3, 14);
   ctx.fillStyle = "#ff3b3b";
   for (const b of state.enemyBullets) ctx.fillRect(b.x - 2, b.y - 5, 4, 10);
 
-  // Explosiones: círculos que crecen y se desvanecen
   for (const ex of state.explosions) {
     const p = ex.time / 0.5;
     ctx.globalAlpha = 1 - p;
@@ -454,41 +651,67 @@ export function draw(ctx: CanvasRenderingContext2D, state: GameState) {
     ctx.globalAlpha = 1;
   }
 
+  for (const p of state.popups) {
+    ctx.globalAlpha = 1 - p.time / 0.9;
+    text(ctx, p.text, p.x, p.y - p.time * 30, "#3bf0ff", 12);
+    ctx.globalAlpha = 1;
+  }
+
   // Marcador
   text(ctx, "PUNTOS", 12, 22, "#ff3b3b", 14, "left");
   text(ctx, String(state.score), 12, 40, "#ffffff", 16, "left");
   text(ctx, "RÉCORD", WIDTH / 2, 22, "#ff3b3b", 14);
   text(ctx, String(state.highScore), WIDTH / 2, 40, "#ffffff", 16);
-  text(ctx, `OLEADA ${state.wave}`, WIDTH - 12, 22, "#3bf0ff", 14, "right");
+  text(ctx, `NIVEL ${state.level}`, WIDTH - 12, 22, "#3bf0ff", 14, "right");
+  text(ctx, muted ? "SIN SONIDO (M)" : "SONIDO (M)", WIDTH - 12, 40, "#888888", 12, "right");
 
-  // Vidas: navecitas abajo a la izquierda
-  if (state.phase === "playing") {
+  if (showPlayer) {
     const spare = state.lives - (state.playerAlive ? 1 : 0);
-    for (let i = 0; i < spare; i++) {
+    for (let i = 0; i < Math.min(spare, 8); i++) {
       drawSprite(ctx, PLAYER_SPRITE, 22 + i * 30, HEIGHT - 14, 1.6);
     }
   }
 
-  if (state.phase === "playing" && state.waveBanner > 0) {
-    text(ctx, `OLEADA ${state.wave}`, WIDTH / 2, HEIGHT / 2, "#3bf0ff", 28);
+  const challenge = isChallengeLevel(state.level);
+  if (state.phase === "playing" && state.levelBanner > 0) {
+    if (challenge) {
+      text(ctx, "¡FASE DE DESAFÍO!", WIDTH / 2, HEIGHT / 2 - 10, "#ffd23b", 28);
+      text(ctx, "Derriba a todos: no te pueden dañar", WIDTH / 2, HEIGHT / 2 + 20, "#ffffff", 14);
+    } else {
+      text(ctx, `NIVEL ${state.level}`, WIDTH / 2, HEIGHT / 2, "#3bf0ff", 30);
+    }
+  }
+
+  if (state.phase === "levelclear") {
+    if (challenge) {
+      const perfect = state.challengeHits === state.challengeTotal;
+      text(ctx, perfect ? "¡PERFECTO!" : "DESAFÍO TERMINADO", WIDTH / 2, HEIGHT / 2 - 40, "#ffd23b", 28);
+      text(ctx, `Derribados: ${state.challengeHits} / ${state.challengeTotal}`, WIDTH / 2, HEIGHT / 2, "#ffffff", 18);
+      text(ctx, `Bonus: ${state.challengeBonus}`, WIDTH / 2, HEIGHT / 2 + 30, "#3bf0ff", 18);
+    } else {
+      text(ctx, `¡NIVEL ${state.level} COMPLETADO!`, WIDTH / 2, HEIGHT / 2, "#3bff6e", 26);
+    }
   }
 
   if (state.phase === "menu") {
-    text(ctx, "GALAXIA", WIDTH / 2, 230, "#ffd23b", 48);
-    text(ctx, "Pulsa ENTER o toca para jugar", WIDTH / 2, 300, "#ffffff", 16);
-    text(ctx, "← → mover   ESPACIO disparar", WIDTH / 2, 340, "#3bf0ff", 14);
-    drawSprite(ctx, BOSS_SPRITE, WIDTH / 2 - 90, 420, SCALE);
-    text(ctx, "150 / 400", WIDTH / 2 - 90, 455, "#ffffff", 12);
-    drawSprite(ctx, BUTTERFLY_SPRITE, WIDTH / 2, 420, SCALE);
-    text(ctx, "80 / 160", WIDTH / 2, 455, "#ffffff", 12);
-    drawSprite(ctx, BEE_SPRITE, WIDTH / 2 + 90, 420, SCALE);
-    text(ctx, "50 / 100", WIDTH / 2 + 90, 455, "#ffffff", 12);
-    text(ctx, "(en formación / atacando)", WIDTH / 2, 480, "#888888", 12);
+    text(ctx, "GALAXIA", WIDTH / 2, 210, "#ffd23b", 48);
+    text(ctx, "Pulsa ENTER o toca para jugar", WIDTH / 2, 280, "#ffffff", 16);
+    text(ctx, "← → mover   ESPACIO disparar   M sonido", WIDTH / 2, 315, "#3bf0ff", 13);
+    drawSprite(ctx, BOSS_SPRITE, WIDTH / 2 - 90, 400, SCALE);
+    text(ctx, "150 / 400", WIDTH / 2 - 90, 435, "#ffffff", 12);
+    drawSprite(ctx, BUTTERFLY_SPRITE, WIDTH / 2, 400, SCALE);
+    text(ctx, "80 / 160", WIDTH / 2, 435, "#ffffff", 12);
+    drawSprite(ctx, BEE_SPRITE, WIDTH / 2 + 90, 400, SCALE);
+    text(ctx, "50 / 100", WIDTH / 2 + 90, 435, "#ffffff", 12);
+    text(ctx, "(en formación / atacando)", WIDTH / 2, 460, "#888888", 12);
+    text(ctx, `Vida extra cada ${EXTRA_LIFE_EVERY} puntos`, WIDTH / 2, 500, "#3bff6e", 12);
+    text(ctx, "Fase de desafío cada 3 niveles", WIDTH / 2, 520, "#ffd23b", 12);
   }
 
   if (state.phase === "gameover") {
-    text(ctx, "GAME OVER", WIDTH / 2, HEIGHT / 2 - 20, "#ff3b3b", 40);
-    text(ctx, `Puntos: ${state.score}`, WIDTH / 2, HEIGHT / 2 + 20, "#ffffff", 18);
-    text(ctx, "Pulsa ENTER o toca para reintentar", WIDTH / 2, HEIGHT / 2 + 60, "#ffd23b", 14);
+    text(ctx, "GAME OVER", WIDTH / 2, HEIGHT / 2 - 30, "#ff3b3b", 40);
+    text(ctx, `Puntos: ${state.score}`, WIDTH / 2, HEIGHT / 2 + 10, "#ffffff", 18);
+    text(ctx, `Llegaste al nivel ${state.level}`, WIDTH / 2, HEIGHT / 2 + 36, "#3bf0ff", 14);
+    text(ctx, "Pulsa ENTER o toca para reintentar", WIDTH / 2, HEIGHT / 2 + 70, "#ffd23b", 14);
   }
 }
