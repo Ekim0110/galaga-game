@@ -68,6 +68,55 @@ export const BOSS_HURT_SPRITE: Sprite = BOSS_SPRITE.map((row) =>
   row.replace(/G/g, "P").replace(/Y/g, "C"),
 );
 
+// Nave nodriza (jefe grande que aparece cada 5 niveles)
+export const MOTHERSHIP_SPRITE: Sprite = [
+  ".......PPPPPPP.......",
+  ".....PPWWWWWWWPP.....",
+  "....PWWCCWWWCCWWP....",
+  "...PPPPPPPPPPPPPPP...",
+  "..PPRRPPYYYYYPPRRPP..",
+  ".PPPPPPPPPPPPPPPPPPP.",
+  "PPGGPPGGPPPPPGGPPGGPP",
+  "PPPPPPPPPPPPPPPPPPPPP",
+  ".PP.RR.PP.R.PP.RR.PP.",
+  "..P..R..P...P..R..P..",
+  ".....R.........R.....",
+];
+
+// Versión blanca de la nodriza: parpadea así cuando recibe un disparo
+export const MOTHERSHIP_FLASH_SPRITE: Sprite = MOTHERSHIP_SPRITE.map((row) => row.replace(/[A-Z]/g, "W"));
+
+// Guardamos cada sprite ya dibujado en un "canvas" pequeño y escondido.
+// Así, en cada cuadro solo copiamos una imagen (drawImage) en vez de pintar
+// cientos de cuadritos uno por uno. Esto hace el juego mucho más fluido,
+// sobre todo en celulares.
+const cache = new Map<Sprite, Map<number, HTMLCanvasElement>>();
+
+function prerender(sprite: Sprite, scale: number) {
+  let byScale = cache.get(sprite);
+  if (!byScale) {
+    byScale = new Map();
+    cache.set(sprite, byScale);
+  }
+  let img = byScale.get(scale);
+  if (!img) {
+    img = document.createElement("canvas");
+    img.width = Math.ceil(sprite[0].length * scale);
+    img.height = Math.ceil(sprite.length * scale);
+    const c = img.getContext("2d")!;
+    for (let r = 0; r < sprite.length; r++) {
+      for (let col = 0; col < sprite[r].length; col++) {
+        const color = PALETTE[sprite[r][col]];
+        if (!color) continue;
+        c.fillStyle = color;
+        c.fillRect(col * scale, r * scale, scale, scale);
+      }
+    }
+    byScale.set(scale, img);
+  }
+  return img;
+}
+
 // Dibuja un sprite centrado en (x, y). "scale" = tamaño de cada pixel.
 export function drawSprite(
   ctx: CanvasRenderingContext2D,
@@ -76,16 +125,6 @@ export function drawSprite(
   y: number,
   scale: number,
 ) {
-  const w = sprite[0].length * scale;
-  const h = sprite.length * scale;
-  const left = Math.round(x - w / 2);
-  const top = Math.round(y - h / 2);
-  for (let r = 0; r < sprite.length; r++) {
-    for (let c = 0; c < sprite[r].length; c++) {
-      const color = PALETTE[sprite[r][c]];
-      if (!color) continue;
-      ctx.fillStyle = color;
-      ctx.fillRect(left + c * scale, top + r * scale, scale, scale);
-    }
-  }
+  const img = prerender(sprite, scale);
+  ctx.drawImage(img, Math.round(x - img.width / 2), Math.round(y - img.height / 2));
 }

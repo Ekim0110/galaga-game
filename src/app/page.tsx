@@ -7,7 +7,7 @@ export default function Home() {
       <h1 className="font-mono text-2xl font-bold tracking-widest text-yellow-300">GALAXIA</h1>
       <GalagaGame />
       <p className="hidden text-center font-mono text-xs text-gray-400 [@media(hover:hover)]:block">
-        ← → o A / D para mover · ESPACIO para disparar · ENTER para empezar · M para el sonido
+        ← → o A / D para mover · ESPACIO disparar · ENTER empezar · M sonido
       </p>
     </main>
   );

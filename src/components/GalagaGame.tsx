@@ -35,7 +35,7 @@ function testStartLevel() {
 export default function GalagaGame() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   // useRef guarda datos que cambian 60 veces por segundo SIN volver a pintar React.
-  const input = useRef<Input>({ left: false, right: false, fire: false });
+  const input = useRef<Input>({ left: false, right: false, fire: false, targetX: null });
   const game = useRef(createGame());
   // useState sí redibuja React: lo usamos para el icono del botón de sonido.
   const [muted, setMuted] = useState(false);
@@ -76,7 +76,35 @@ export default function GalagaGame() {
     const onUp = (e: KeyboardEvent) => setKey(e, false);
     window.addEventListener("keydown", onDown);
     window.addEventListener("keyup", onUp);
-    canvas.addEventListener("pointerdown", start);
+
+    // --- Tocar y arrastrar sobre el juego (celular) ---
+    // Convierte la posición del dedo en pantalla a coordenadas del juego.
+    const toGameX = (e: PointerEvent) => {
+      const rect = canvas.getBoundingClientRect();
+      return ((e.clientX - rect.left) / rect.width) * WIDTH;
+    };
+    const onCanvasDown = (e: PointerEvent) => {
+      const wasPlaying = game.current.phase === "playing";
+      start();
+      // Solo con dedo (no ratón): la nave sigue al dedo y dispara sola mientras tocas
+      if (wasPlaying && e.pointerType !== "mouse") {
+        canvas.setPointerCapture(e.pointerId);
+        input.current.targetX = toGameX(e);
+        input.current.fire = true;
+      }
+    };
+    const onCanvasMove = (e: PointerEvent) => {
+      if (input.current.targetX !== null) input.current.targetX = toGameX(e);
+    };
+    const onCanvasUp = () => {
+      if (input.current.targetX === null) return;
+      input.current.targetX = null;
+      input.current.fire = false;
+    };
+    canvas.addEventListener("pointerdown", onCanvasDown);
+    canvas.addEventListener("pointermove", onCanvasMove);
+    canvas.addEventListener("pointerup", onCanvasUp);
+    canvas.addEventListener("pointercancel", onCanvasUp);
 
     // --- Bucle del juego ---
     let last = performance.now();
@@ -104,20 +132,26 @@ export default function GalagaGame() {
       cancelAnimationFrame(rafId);
       window.removeEventListener("keydown", onDown);
       window.removeEventListener("keyup", onUp);
-      canvas.removeEventListener("pointerdown", start);
+      canvas.removeEventListener("pointerdown", onCanvasDown);
+      canvas.removeEventListener("pointermove", onCanvasMove);
+      canvas.removeEventListener("pointerup", onCanvasUp);
+      canvas.removeEventListener("pointercancel", onCanvasUp);
     };
   }, []);
 
   // Botones táctiles para jugar en el celular
-  const hold = (key: keyof Input) => ({
-    onPointerDown: (e: React.PointerEvent) => {
+  const hold = (key: "left" | "right" | "fire") => ({
+    onPointerDown: (e: React.PointerEvent<HTMLButtonElement>) => {
       e.preventDefault();
+      // "Capturar" el dedo: aunque se deslice un poco fuera del botón, sigue contando.
+      // Antes el botón se soltaba solo y la nave se sentía lenta o trabada.
+      e.currentTarget.setPointerCapture(e.pointerId);
       input.current[key] = true;
       start();
     },
     onPointerUp: () => (input.current[key] = false),
-    onPointerLeave: () => (input.current[key] = false),
     onPointerCancel: () => (input.current[key] = false),
+    onContextMenu: (e: React.MouseEvent) => e.preventDefault(), // evita el menú al mantener pulsado
   });
 
   const btn =
@@ -130,7 +164,7 @@ export default function GalagaGame() {
           ref={canvasRef}
           width={WIDTH}
           height={HEIGHT}
-          className="w-full rounded-lg border-2 border-cyan-500/50 shadow-[0_0_30px_rgba(59,240,255,0.25)] [image-rendering:pixelated]"
+          className="w-full touch-none select-none rounded-lg border-2 border-cyan-500/50 shadow-[0_0_30px_rgba(59,240,255,0.25)] [image-rendering:pixelated]"
           style={{ aspectRatio: `${WIDTH} / ${HEIGHT}` }}
         />
         {/* Botón de sonido: se ve en celular, donde no hay tecla M */}

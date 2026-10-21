@@ -8,6 +8,8 @@ import {
   BOSS_HURT_SPRITE,
   BOSS_SPRITE,
   BUTTERFLY_SPRITE,
+  MOTHERSHIP_FLASH_SPRITE,
+  MOTHERSHIP_SPRITE,
   PLAYER_SPRITE,
   drawSprite,
 } from "./sprites";
@@ -18,9 +20,9 @@ export const WIDTH = 480;
 export const HEIGHT = 640;
 
 const SCALE = 3; // tamaño de cada pixel de los sprites
-const PLAYER_SPEED = 260; // pixeles por segundo
-const BULLET_SPEED = 520;
-const MAX_PLAYER_BULLETS = 2; // como en el Galaga original: máximo 2 balas a la vez
+const PLAYER_SPEED = 330; // pixeles por segundo (más alto = nave más ágil)
+const BULLET_SPEED = 820; // velocidad de tus balas
+const MAX_PLAYER_BULLETS = 3; // cuántas balas tuyas puede haber a la vez en pantalla
 const START_LIVES = 3;
 const EXTRA_LIFE_EVERY = 20000; // puntos para ganar una vida extra
 const PLAYER_Y = HEIGHT - 50;
@@ -46,6 +48,19 @@ export interface Enemy {
   // Solo para la fase de desafío:
   path: number;
   delay: number;
+  escort: boolean; // true = lo lanzó la nave nodriza; se va al salir de la pantalla
+}
+
+// La nave nodriza: un jefe grande con mucha vida
+export interface Mothership {
+  x: number;
+  y: number;
+  hp: number;
+  maxHp: number;
+  time: number;
+  shootTimer: number;
+  spawnTimer: number;
+  flash: number; // segundos que se ve blanca tras un impacto
 }
 
 interface Bullet {
@@ -94,6 +109,7 @@ export interface GameState {
   bullets: Bullet[];
   enemyBullets: Bullet[];
   enemies: Enemy[];
+  mothership: Mothership | null;
   stars: Star[];
   explosions: Explosion[];
   popups: Popup[];
@@ -113,6 +129,8 @@ export interface Input {
   left: boolean;
   right: boolean;
   fire: boolean;
+  // En el celular: posición X del dedo sobre el juego (null = no está tocando)
+  targetX: number | null;
 }
 
 // ---------- Niveles ----------
@@ -164,9 +182,18 @@ const LAYOUTS: string[][] = [
   ],
 ];
 
-// Cada 3 niveles hay una "fase de desafío" (como en Galaga).
+// Cada 5 niveles aparece la nave nodriza.
+export function isBossLevel(level: number) {
+  return level % 5 === 0;
+}
+
+// Cada 3 niveles hay una "fase de desafío" (como en Galaga), salvo si toca nodriza.
 export function isChallengeLevel(level: number) {
-  return level % 3 === 0;
+  return level % 3 === 0 && !isBossLevel(level);
+}
+
+function isNormalLevel(level: number) {
+  return !isBossLevel(level) && !isChallengeLevel(level);
 }
 
 // Los números de dificultad suben con el nivel, pero con un tope para que siga siendo jugable.
@@ -197,12 +224,14 @@ function newEnemy(kind: EnemyKind, slotX: number, slotY: number): Enemy {
     nextShotY: 0,
     path: 0,
     delay: 0,
+    escort: false,
   };
 }
 
 function makeFormation(level: number): Enemy[] {
-  // Cuál formación toca (sin contar las fases de desafío)
-  const normalIndex = level - 1 - Math.floor(level / 3);
+  // Cuál formación toca: contamos los niveles normales anteriores
+  let normalIndex = 0;
+  for (let l = 1; l < level; l++) if (isNormalLevel(l)) normalIndex++;
   const layout = LAYOUTS[normalIndex % LAYOUTS.length];
   const spacingX = 42;
   const spacingY = 34;
@@ -289,6 +318,7 @@ export function createGame(highScore = 0): GameState {
     bullets: [],
     enemyBullets: [],
     enemies: [],
+    mothership: null,
     stars: makeStars(),
     explosions: [],
     popups: [],
@@ -303,10 +333,17 @@ export function createGame(highScore = 0): GameState {
   };
 }
 
+function makeMothership(level: number): Mothership {
+  const hp = 40 + level * 3; // más vida en cada aparición
+  return { x: WIDTH / 2, y: -60, hp, maxHp: hp, time: 0, shootTimer: 2.5, spawnTimer: 4, flash: 0 };
+}
+
 function beginLevel(state: GameState) {
   const challenge = isChallengeLevel(state.level);
+  const boss = isBossLevel(state.level);
   state.phase = "playing";
-  state.enemies = challenge ? makeChallenge(state.level) : makeFormation(state.level);
+  state.enemies = boss ? [] : challenge ? makeChallenge(state.level) : makeFormation(state.level);
+  state.mothership = boss ? makeMothership(state.level) : null;
   state.enemyBullets = [];
   state.bullets = [];
   state.levelBanner = 2;
@@ -315,7 +352,7 @@ function beginLevel(state: GameState) {
   state.challengeHits = 0;
   state.challengeTotal = challenge ? state.enemies.length : 0;
   state.challengeBonus = 0;
-  state.events.push(challenge ? "challengeStart" : "levelStart");
+  state.events.push(boss ? "bossAppear" : challenge ? "challengeStart" : "levelStart");
 }
 
 // "startLevel" permite empezar en otro nivel (solo lo usamos para probar).
@@ -410,13 +447,20 @@ export function update(state: GameState, dt: number, input: Input) {
 
   // --- Jugador ---
   if (state.playerAlive) {
-    if (input.left) state.playerX -= PLAYER_SPEED * dt;
-    if (input.right) state.playerX += PLAYER_SPEED * dt;
+    if (input.targetX !== null) {
+      // Con el dedo: la nave va hacia donde tocas, muy rápido pero sin teletransportarse
+      const dx = input.targetX - state.playerX;
+      const maxStep = PLAYER_SPEED * 1.8 * dt;
+      state.playerX += Math.max(-maxStep, Math.min(maxStep, dx));
+    } else {
+      if (input.left) state.playerX -= PLAYER_SPEED * dt;
+      if (input.right) state.playerX += PLAYER_SPEED * dt;
+    }
     state.playerX = Math.max(25, Math.min(WIDTH - 25, state.playerX));
 
     if (input.fire && state.shootCooldown === 0 && state.bullets.length < MAX_PLAYER_BULLETS) {
       state.bullets.push({ x: state.playerX, y: PLAYER_Y - 20, vx: 0, vy: -BULLET_SPEED });
-      state.shootCooldown = 0.18;
+      state.shootCooldown = 0.11; // tiempo mínimo entre disparos
       state.events.push("shoot");
     }
   } else {
@@ -452,6 +496,52 @@ export function update(state: GameState, dt: number, input: Input) {
       e.shotsLeft = diff.shotsPerDive;
       e.nextShotY = 200;
       state.diveTimer = diff.diveInterval * (0.6 + Math.random() * 0.8);
+      state.events.push("dive");
+    }
+  }
+
+  // --- Nave nodriza ---
+  const m = state.mothership;
+  if (m) {
+    m.time += dt;
+    m.flash = Math.max(0, m.flash - dt);
+    const angry = m.hp < m.maxHp / 2; // con poca vida se enoja y ataca más
+    // Entra desde arriba y luego se mece de lado a lado
+    if (m.y < 130) m.y += 70 * dt;
+    else m.y = 130 + Math.sin(m.time * 0.9) * 18;
+    m.x = WIDTH / 2 + Math.sin(m.time * (angry ? 0.9 : 0.6)) * 150;
+    const ready = m.y >= 120;
+
+    // Disparo en abanico apuntando al jugador
+    m.shootTimer -= dt;
+    if (ready && m.shootTimer <= 0 && state.playerAlive) {
+      const n = 3 + Math.min(Math.floor(state.level / 5) - 1, 2) + (angry ? 1 : 0);
+      const base = Math.atan2(PLAYER_Y - m.y, state.playerX - m.x);
+      const speed = diff.enemyBulletSpeed * 0.85;
+      for (let i = 0; i < n; i++) {
+        const a = base + (i - (n - 1) / 2) * 0.22;
+        state.enemyBullets.push({ x: m.x, y: m.y + 25, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed });
+      }
+      m.shootTimer = Math.max(0.9, 1.9 - state.level * 0.04) * (angry ? 0.7 : 1);
+    }
+
+    // Lanza abejas escoltas que bajan en picada
+    m.spawnTimer -= dt;
+    const escorts = state.enemies.filter((e) => e.escort).length;
+    if (ready && m.spawnTimer <= 0 && escorts < 6 && state.playerAlive) {
+      for (const side of [-1, 1] as const) {
+        const e = newEnemy("bee", m.x + side * 40, m.y + 20);
+        e.x = e.slotX;
+        e.y = e.slotY;
+        e.mode = "diving";
+        e.diveTime = 0.5; // se salta el rizo inicial
+        e.diveDir = side;
+        e.escort = true;
+        e.shotsLeft = 1;
+        e.nextShotY = m.y + 90;
+        state.enemies.push(e);
+      }
+      m.spawnTimer = angry ? 3 : 4.5;
       state.events.push("dive");
     }
   }
@@ -514,7 +604,9 @@ export function update(state: GameState, dt: number, input: Input) {
           vy: diff.enemyBulletSpeed,
         });
       }
-      if (e.y > HEIGHT + 30) {
+      if (e.y > HEIGHT + 30 && e.escort) {
+        e.hp = -1; // las escoltas no vuelven: desaparecen
+      } else if (e.y > HEIGHT + 30) {
         e.y = -30;
         e.x = slot.x;
         e.mode = "returning";
@@ -544,6 +636,41 @@ export function update(state: GameState, dt: number, input: Input) {
       }
     }
   }
+  // --- Balas del jugador contra la nave nodriza ---
+  if (m) {
+    for (const b of state.bullets) {
+      if (b.y > 0 && hit(b.x, b.y, m.x, m.y, 55, 28)) {
+        b.y = -100;
+        m.hp -= 1;
+        m.flash = 0.08;
+        addScore(state, 10, m.x, m.y);
+        state.events.push("bossHit");
+      }
+    }
+    if (m.hp <= 0) {
+      const bonus = 5000 * Math.floor(state.level / 5);
+      addScore(state, bonus, m.x, m.y - 40);
+      for (let i = 0; i < 8; i++) {
+        state.explosions.push({
+          x: m.x + (Math.random() - 0.5) * 100,
+          y: m.y + (Math.random() - 0.5) * 50,
+          time: -i * 0.08, // explosiones en cadena
+          color: i % 2 ? "#c43bff" : "#ffffff",
+        });
+      }
+      // Al caer la nodriza, sus escoltas explotan también
+      for (const e of state.enemies) {
+        if (!e.escort) continue;
+        e.hp = 0;
+        addScore(state, 100, e.x, e.y);
+        state.explosions.push({ x: e.x, y: e.y, time: 0, color: enemyColor(e.kind) });
+      }
+      state.enemyBullets = [];
+      state.mothership = null;
+      state.events.push("bossDefeat");
+    }
+  }
+
   state.bullets = state.bullets.filter((b) => b.y > -10);
   state.enemies = state.enemies.filter((e) => e.hp > 0);
 
@@ -564,7 +691,7 @@ export function update(state: GameState, dt: number, input: Input) {
   }
 
   // --- ¿Nivel terminado? ---
-  if (state.phase === "playing" && state.enemies.length === 0) {
+  if (state.phase === "playing" && state.enemies.length === 0 && !state.mothership) {
     state.phase = "levelclear";
     state.phaseTimer = challenge ? 3.5 : 2.5;
     state.enemyBullets = [];
@@ -624,6 +751,19 @@ export function draw(ctx: CanvasRenderingContext2D, state: GameState, muted = fa
     drawSprite(ctx, enemySprite(e), e.x, e.y, SCALE);
   }
 
+  const m = state.mothership;
+  if (m) {
+    drawSprite(ctx, m.flash > 0 ? MOTHERSHIP_FLASH_SPRITE : MOTHERSHIP_SPRITE, m.x, m.y, 5);
+    // Barra de vida
+    const barW = 260;
+    const left = WIDTH / 2 - barW / 2;
+    ctx.fillStyle = "#333333";
+    ctx.fillRect(left, 52, barW, 8);
+    ctx.fillStyle = m.hp < m.maxHp / 2 ? "#ff3b3b" : "#c43bff";
+    ctx.fillRect(left, 52, (barW * Math.max(m.hp, 0)) / m.maxHp, 8);
+    text(ctx, "NAVE NODRIZA", WIDTH / 2, 74, "#c43bff", 11);
+  }
+
   const showPlayer = state.phase === "playing" || state.phase === "levelclear";
   const blink = state.invulnerable > 0 && Math.floor(state.invulnerable * 10) % 2 === 0;
   if (showPlayer && state.playerAlive && !blink) {
@@ -636,6 +776,7 @@ export function draw(ctx: CanvasRenderingContext2D, state: GameState, muted = fa
   for (const b of state.enemyBullets) ctx.fillRect(b.x - 2, b.y - 5, 4, 10);
 
   for (const ex of state.explosions) {
+    if (ex.time < 0) continue; // aún no le toca explotar
     const p = ex.time / 0.5;
     ctx.globalAlpha = 1 - p;
     ctx.strokeStyle = ex.color;
@@ -674,7 +815,10 @@ export function draw(ctx: CanvasRenderingContext2D, state: GameState, muted = fa
 
   const challenge = isChallengeLevel(state.level);
   if (state.phase === "playing" && state.levelBanner > 0) {
-    if (challenge) {
+    if (isBossLevel(state.level)) {
+      text(ctx, "¡NAVE NODRIZA!", WIDTH / 2, HEIGHT / 2 - 10, "#c43bff", 30);
+      text(ctx, "Esquiva sus disparos en abanico", WIDTH / 2, HEIGHT / 2 + 20, "#ffffff", 14);
+    } else if (challenge) {
       text(ctx, "¡FASE DE DESAFÍO!", WIDTH / 2, HEIGHT / 2 - 10, "#ffd23b", 28);
       text(ctx, "Derriba a todos: no te pueden dañar", WIDTH / 2, HEIGHT / 2 + 20, "#ffffff", 14);
     } else {
@@ -688,6 +832,9 @@ export function draw(ctx: CanvasRenderingContext2D, state: GameState, muted = fa
       text(ctx, perfect ? "¡PERFECTO!" : "DESAFÍO TERMINADO", WIDTH / 2, HEIGHT / 2 - 40, "#ffd23b", 28);
       text(ctx, `Derribados: ${state.challengeHits} / ${state.challengeTotal}`, WIDTH / 2, HEIGHT / 2, "#ffffff", 18);
       text(ctx, `Bonus: ${state.challengeBonus}`, WIDTH / 2, HEIGHT / 2 + 30, "#3bf0ff", 18);
+    } else if (isBossLevel(state.level)) {
+      text(ctx, "¡NODRIZA DERRIBADA!", WIDTH / 2, HEIGHT / 2 - 10, "#c43bff", 28);
+      text(ctx, `Bonus: ${5000 * Math.floor(state.level / 5)}`, WIDTH / 2, HEIGHT / 2 + 25, "#3bf0ff", 18);
     } else {
       text(ctx, `¡NIVEL ${state.level} COMPLETADO!`, WIDTH / 2, HEIGHT / 2, "#3bff6e", 26);
     }
@@ -706,6 +853,7 @@ export function draw(ctx: CanvasRenderingContext2D, state: GameState, muted = fa
     text(ctx, "(en formación / atacando)", WIDTH / 2, 460, "#888888", 12);
     text(ctx, `Vida extra cada ${EXTRA_LIFE_EVERY} puntos`, WIDTH / 2, 500, "#3bff6e", 12);
     text(ctx, "Fase de desafío cada 3 niveles", WIDTH / 2, 520, "#ffd23b", 12);
+    text(ctx, "Nave nodriza cada 5 niveles", WIDTH / 2, 540, "#c43bff", 12);
   }
 
   if (state.phase === "gameover") {
