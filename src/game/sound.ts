@@ -14,6 +14,8 @@ export type SoundEvent =
   | "challengeStart"
   | "perfect"
   | "extraLife"
+  | "bossAppear"
+  | "bossDefeat"
   | "gameOver";
 
 const MUTE_KEY = "galaxia-silencio";
@@ -153,6 +155,18 @@ export function playSound(event: SoundEvent) {
       break;
     case "extraLife":
       melody([[N.A5, 0.08], [N.C6, 0.08], [N.E6, 0.25]], "triangle", 0.35);
+      break;
+    case "bossAppear":
+      // Sirena: un tono que sube y baja varias veces
+      for (let i = 0; i < 3; i++) {
+        tone("sawtooth", 220, 440, 0.3, 0.18, i * 0.6);
+        tone("sawtooth", 440, 220, 0.3, 0.18, i * 0.6 + 0.3);
+      }
+      break;
+    case "bossDefeat":
+      noise(1.5, 0.7, 3000);
+      tone("sawtooth", 300, 20, 1.5, 0.35);
+      melody([[0, 0.8], [N.C5, 0.12], [N.E5, 0.12], [N.G5, 0.12], [N.C6, 0.12], [N.E6, 0.12], [N.G6, 0.5]], "triangle", 0.3);
       break;
     case "gameOver":
       melody([[N.G5, 0.25], [N.E5, 0.25], [N.D5, 0.25], [N.C5, 0.6]], "triangle", 0.35);
