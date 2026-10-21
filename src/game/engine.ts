@@ -21,8 +21,8 @@ export const HEIGHT = 640;
 
 const SCALE = 3; // tamaño de cada pixel de los sprites
 const PLAYER_SPEED = 330; // pixeles por segundo (más alto = nave más ágil)
-const BULLET_SPEED = 520;
-const MAX_PLAYER_BULLETS = 2; // como en el Galaga original: máximo 2 balas a la vez
+const BULLET_SPEED = 820; // velocidad de tus balas
+const MAX_PLAYER_BULLETS = 3; // cuántas balas tuyas puede haber a la vez en pantalla
 const START_LIVES = 3;
 const EXTRA_LIFE_EVERY = 20000; // puntos para ganar una vida extra
 const PLAYER_Y = HEIGHT - 50;
@@ -334,7 +334,7 @@ export function createGame(highScore = 0): GameState {
 }
 
 function makeMothership(level: number): Mothership {
-  const hp = 24 + level * 2; // más vida en cada aparición
+  const hp = 40 + level * 3; // más vida en cada aparición
   return { x: WIDTH / 2, y: -60, hp, maxHp: hp, time: 0, shootTimer: 2.5, spawnTimer: 4, flash: 0 };
 }
 
@@ -460,7 +460,7 @@ export function update(state: GameState, dt: number, input: Input) {
 
     if (input.fire && state.shootCooldown === 0 && state.bullets.length < MAX_PLAYER_BULLETS) {
       state.bullets.push({ x: state.playerX, y: PLAYER_Y - 20, vx: 0, vy: -BULLET_SPEED });
-      state.shootCooldown = 0.18;
+      state.shootCooldown = 0.11; // tiempo mínimo entre disparos
       state.events.push("shoot");
     }
   } else {
